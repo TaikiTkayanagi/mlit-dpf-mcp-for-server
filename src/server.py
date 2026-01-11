@@ -1,12 +1,20 @@
 # --- BEGIN robust import header ---
+import contextlib
+from starlette.applications import Starlette
+from starlette.routing import Mount
+from starlette.types import Scope, Receive, Send
 import sys, pathlib
+
+import uvicorn
+from dotenv import load_dotenv
+load_dotenv()
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 # --- END robust import header ---
 
 import json
-from typing import Any, Dict, List, Optional, Union, TypeAlias
+from typing import Any, AsyncIterator, Dict, List, Optional, Union, TypeAlias
 
 from mcp.server import Server
 import mcp.types as types
@@ -34,7 +42,7 @@ from src.config import load_settings
 from src.utils import logger, new_request_id, Timer
 
 from mcp.server.stdio import stdio_server
-import anyio
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 try:
     from mcp.types import JSONValue
@@ -43,6 +51,13 @@ except Exception:
     JSONLike: TypeAlias = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
 
 server = Server("MLIT-DATA-PLATFORM-mcp-mod")
+
+session_manager = StreamableHTTPSessionManager(
+    app=server,         # 上で作った MCP Server
+    event_store=None,   # 必要なら resumability 用の EventStore を渡す
+    stateless=True,     # Stateless モード（Databricks/Google などの例と同じ）
+    json_response=True, # JSON レスポンスを返す（SSE ではなく）
+)
 
 # ---------- tools catalog ----------
 @server.list_tools()
@@ -1503,7 +1518,29 @@ async def _main() -> None:
         )
 
         await server.run(read, write, init_opts)
+        
+@contextlib.asynccontextmanager
+async def lifespan(app: Starlette) -> AsyncIterator[None]:
+    """StreamableHTTP のセッションマネージャのライフサイクル管理."""
+    async with session_manager.run():
+        logger.info("Application started with StreamableHTTP session manager!")
+        try:
+            yield
+        finally:
+            logger.info("Application shutting down...")
+        
+async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
+    """Streamable HTTP エンドポイント (/mcp) の ASGI アプリ."""
+    await session_manager.handle_request(scope, receive, send)
 
+# Starlette アプリ本体
+app = Starlette(
+    routes=[
+        # /mcp に Streamable HTTP エンドポイントをマウント
+        Mount("/mcp", app=handle_streamable_http),
+    ],
+    lifespan=lifespan,
+)
 
 if __name__ == "__main__":
-    anyio.run(_main)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
